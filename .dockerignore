@@ -1,0 +1,12 @@
+.git
+.github
+**/node_modules
+**/coverage
+**/dist
+**/.deno
+examples
+tests
+public
+*.md
+Dockerfile
+.dockerignore

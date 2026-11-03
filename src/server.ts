@@ -1,92 +1,111 @@
-import { itemStore } from './kv/store.ts';
-import type { SystemDiagnostics } from './types.ts';
+import type { ItemStore } from "./store.ts";
+import type { HealthReport } from "./types.ts";
+import { parseNewItem } from "./validation.ts";
 
-export function handleRequest(req: Request): Response | Promise<Response> {
-  const url = new URL(req.url);
-  const start = performance.now();
+export type Handler = (req: Request) => Promise<Response>;
 
-  const jsonResponse = (data: unknown, status = 200) => {
-    const elapsedMs = (performance.now() - start).toFixed(3);
-    return new Response(JSON.stringify(data, null, 2), {
-      status,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Response-Time-Ms': elapsedMs,
-        'X-Runtime': 'Deno-2'
+const ITEMS_PATH = "/api/v1/items";
+const ITEM_BY_ID = new URLPattern({ pathname: `${ITEMS_PATH}/:id` });
+
+function errorResponse(status: number, message: string): Response {
+  return Response.json({ error: message }, { status });
+}
+
+function methodNotAllowed(allow: string): Response {
+  return new Response(null, { status: 405, headers: { Allow: allow } });
+}
+
+/**
+ * Builds the request handler. The store is a parameter, so tests can hand
+ * in a fresh one and never need a socket or a permission flag.
+ */
+export function createHandler(
+  store: ItemStore,
+  startedAt: number = performance.now(),
+): Handler {
+  async function route(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const { pathname } = url;
+
+    if (pathname === "/") {
+      if (req.method !== "GET") return methodNotAllowed("GET");
+      return Response.json({
+        name: "learn-deno starter",
+        endpoints: ["/health", ITEMS_PATH, `${ITEMS_PATH}/:id`],
+      });
+    }
+
+    if (pathname === "/health") {
+      if (req.method !== "GET") return methodNotAllowed("GET");
+      const report: HealthReport = {
+        status: "ok",
+        deno: Deno.version.deno,
+        v8: Deno.version.v8,
+        typescript: Deno.version.typescript,
+        target: Deno.build.target,
+        uptimeSeconds: Math.round((performance.now() - startedAt) / 1000),
+      };
+      return Response.json(report);
+    }
+
+    if (pathname === ITEMS_PATH) {
+      if (req.method === "GET") {
+        const items = await store.list();
+        return Response.json({ data: items, total: items.length });
       }
-    });
-  };
-
-  // 1. Root Discovery
-  if (url.pathname === '/' && req.method === 'GET') {
-    return jsonResponse({
-      name: 'Learn Deno 2 Edge Cloud Masterclass API',
-      version: '1.0.0',
-      runtime: 'Deno',
-      denoVersion: Deno.version.deno,
-      v8Version: Deno.version.v8,
-      endpoints: {
-        health: '/health',
-        items: '/api/v1/items'
-      }
-    });
-  }
-
-  // 2. Health & System Diagnostics
-  if (url.pathname === '/health' && req.method === 'GET') {
-    const mem = Deno.memoryUsage();
-    const diagnostics: SystemDiagnostics = {
-      runtime: 'Deno',
-      denoVersion: Deno.version.deno,
-      v8Version: Deno.version.v8,
-      typescriptVersion: Deno.version.typescript,
-      target: Deno.build.target,
-      uptimeSeconds: Math.round(performance.now() / 1000),
-      memoryUsageMb: Math.round(mem.heapUsed / 1024 / 1024)
-    };
-    return jsonResponse({ status: 'healthy', diagnostics });
-  }
-
-  // 3. GET /api/v1/items
-  if (url.pathname === '/api/v1/items' && req.method === 'GET') {
-    return (async () => {
-      const items = await itemStore.getAll();
-      return jsonResponse({ success: true, data: items, meta: { total: items.length } });
-    })();
-  }
-
-  // 4. POST /api/v1/items
-  if (url.pathname === '/api/v1/items' && req.method === 'POST') {
-    return (async () => {
-      try {
-        const body = (await req.json()) as { title?: string; description?: string; status?: string };
-        if (!body.title || typeof body.title !== 'string') {
-          return jsonResponse({ success: false, error: 'Title is required' }, 400);
+      if (req.method === "POST") {
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return errorResponse(400, "Body is not valid JSON");
         }
-        const created = await itemStore.create(
-          body.title,
-          body.description || '',
-          (body.status as any) || 'pending'
-        );
-        return jsonResponse({ success: true, data: created }, 201);
-      } catch {
-        return jsonResponse({ success: false, error: 'Malformed JSON payload' }, 400);
+        const parsed = parseNewItem(body);
+        if (!parsed.ok) return errorResponse(400, parsed.error);
+
+        const item = await store.create(parsed.value);
+        return Response.json({ data: item }, {
+          status: 201,
+          headers: { Location: `${ITEMS_PATH}/${item.id}` },
+        });
       }
-    })();
+      return methodNotAllowed("GET, POST");
+    }
+
+    const match = ITEM_BY_ID.exec(url);
+    if (match) {
+      const id = match.pathname.groups.id ?? "";
+      if (req.method === "GET") {
+        const item = await store.get(id);
+        return item
+          ? Response.json({ data: item })
+          : errorResponse(404, `Item ${id} not found`);
+      }
+      if (req.method === "DELETE") {
+        const deleted = await store.delete(id);
+        return deleted
+          ? new Response(null, { status: 204 })
+          : errorResponse(404, `Item ${id} not found`);
+      }
+      return methodNotAllowed("GET, DELETE");
+    }
+
+    return errorResponse(404, `No route for ${req.method} ${pathname}`);
   }
 
-  // 5. DELETE /api/v1/items/:id
-  if (url.pathname.startsWith('/api/v1/items/') && req.method === 'DELETE') {
-    return (async () => {
-      const id = url.pathname.split('/').pop() || '';
-      const deleted = await itemStore.delete(id);
-      if (!deleted) {
-        return jsonResponse({ success: false, error: `Item with id ${id} not found` }, 404);
-      }
-      return jsonResponse({ success: true, data: { deletedId: id } });
-    })();
-  }
-
-  // 404 Not Found
-  return jsonResponse({ success: false, error: `Route not found: ${req.method} ${url.pathname}` }, 404);
+  return async (req) => {
+    const start = performance.now();
+    let res: Response;
+    try {
+      res = await route(req);
+    } catch (err) {
+      console.error("unhandled error", err);
+      res = errorResponse(500, "Internal server error");
+    }
+    res.headers.set(
+      "X-Response-Time-Ms",
+      (performance.now() - start).toFixed(2),
+    );
+    return res;
+  };
 }

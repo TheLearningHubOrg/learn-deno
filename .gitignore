@@ -1,4 +1,23 @@
-.DS_Store
-.env
-*.log
+# Deno
+dist/
 coverage/
+cov_profile/
+.deno/
+node_modules/
+vendor/
+tmp-demo/
+*.log
+
+# Editors and OS
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env files (never commit secrets)
+.env
+.env.*
+!.env.example
